@@ -1499,6 +1499,63 @@ def failFilesCmd(startResponse, jsonDict, user):
 
   return httpOK(startResponse, '')
 
+def checkScopeWritable(scopeName, user):
+  """May this user create or remove files in this Rucio scope?
+
+  Returns None if they may, or an (httpCode, message) tuple if not.
+
+  This is the rule already applied when a workflow is created that
+  writes to a scope. It is lifted out here so that a second caller
+  cannot drift away from it. The two existing call sites could adopt
+  this function as well; they are left alone to keep this change small.
+  """
+  if not justin.stringIsScope(scopeName):
+    return ('400 Bad Request',
+            'Scope name can only be characters a-z 0-9 - _ .')
+
+  try:
+      scopeRow = justin.select('SELECT scope_id,wlcg_group_name,quota_name,'
+                    'principal_name '
+                    'FROM scopes '
+                    'LEFT JOIN named_quotas '
+                    'ON named_quotas.quota_id=scopes.quota_id '
+                    'LEFT JOIN users '
+                    'ON users.user_id=named_quotas.user_id '
+                    'LEFT JOIN principal_names '
+                    'ON principal_names.pn_id=users.main_pn_id '
+                    'LEFT JOIN wlcg_groups '
+                    'ON wlcg_groups.wlcg_group_id=named_quotas.wlcg_group_id '
+                    'WHERE scope_name="%s"' % scopeName,
+                    justOne=True)
+
+      quotaName     = scopeRow['quota_name']
+      wlcgGroupName = scopeRow['wlcg_group_name']
+      principalName = scopeRow['principal_name']
+
+      if not int(scopeRow['scope_id']):
+        raise
+  except:
+      return ('400 Bad Request',
+              'Failed to find scope %s in justIN database' % scopeName)
+
+  if not quotaName:
+      return ('403 Forbidden',
+       'Scope %s has no named quota defined and cannot yet be used via justIN'
+       % scopeName)
+
+  if wlcgGroupName:
+    if wlcgGroupName not in user['wlcg_groups']:
+      return ('403 Forbidden',
+              'You need to be in group %s to use scope %s'
+              % (wlcgGroupName, scopeName))
+
+  elif principalName != user['user_name']:
+    return ('403 Forbidden',
+            'You need to be %s to use scope %s'
+            % (principalName, scopeName))
+
+  return None
+
 def showJobsCmd(startResponse, jsonDict):
 
   try:
