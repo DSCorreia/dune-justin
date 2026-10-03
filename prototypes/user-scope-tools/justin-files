@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+#
+# justin-files - would justIN let you manage this file?
+#
+# Part of a prototype exploring interactive file management in per-user
+# Rucio scopes. See README.md in this directory.
+#
+# NOTHING HERE TOUCHES RUCIO. Every operation stops at the point where a
+# privileged credential would be needed and prints what it would have
+# done. That boundary is the subject of the prototype, not an omission:
+# justIN writes all output with the dunepro account, and there is
+# currently no way for a user to act on their own files outside a job.
+#
+# Read-only operations are deliberately absent. Users can already read
+# their files; the gap is writing, moving and deleting.
+#
+# Standard library only, to match commands/justin.
+
+import sys
+import argparse
+
+import justin_token
+import justin_scopes
+import justin_decide
+import justin_identity
+import justin_rucio
+
+
+# Exit codes. Distinct per outcome so a script can tell them apart -
+# collapsing LIKELY into ALLOWED would undo the point of having both.
+EXIT_ALLOWED = 0
+EXIT_ERROR = 1
+EXIT_DENIED = 2
+EXIT_LIKELY = 3
+EXIT_UNDETERMINED = 4
+
+EXIT_FOR = {
+  justin_decide.ALLOWED:      EXIT_ALLOWED,
+  justin_decide.DENIED:       EXIT_DENIED,
+  justin_decide.LIKELY:       EXIT_LIKELY,
+  justin_decide.UNDETERMINED: EXIT_UNDETERMINED,
+}
+
+def resolveIdentity(principalOverride=None, groupsOverride=None):
+  """Your principal name and groups, as justIN sees them.
+
+  Earlier versions of this looked in the token. That was wrong: a real
+  DUNE WLCG token carries an opaque UUID as its subject and no principal
+  name at all - see the header of justin_identity.py. justIN holds that
+  information in your session, so we ask it directly.
+
+  Groups also come from justIN rather than the token. The two agreed when
+  checked, but justIN's decision is made against its own session, so its
+  view is the faithful one to predict against.
+  """
+  if principalOverride and groupsOverride is not None:
+    return principalOverride, groupsOverride
+
+  principal, groups = justin_identity.whoami()
+
+  if principalOverride:
+    principal = principalOverride
+
+  if groupsOverride is not None:
+    groups = groupsOverride
+
+  return principal, groups
+
+
+def splitDID(did):
+  """'scope:name' -> ('scope', 'name'). Raises ValueError if malformed."""
+  if ':' not in did:
+    raise ValueError('expected scope:name, got %r' % did)
+
+  scope, _, name = did.partition(':')
+
+  if not scope or not name:
+    raise ValueError('expected scope:name, got %r' % did)
+
+  return scope, name
+
+
+def plannedCalls(args):
+  """The Rucio commands this operation would need, as display strings.
+
+  These are written to match real Rucio operations. Note that Rucio has
+  no rename primitive for files: a DID is an identifier, not a path. The
+  'mv' verb therefore moves a file BETWEEN DATASETS, which is attach plus
+  detach. Renaming a file in place means uploading it under a new DID and
+  erasing the old one, which is a copy, not a move.
+
+  Confirmed against rucio v38_1_0: the only rename() functions in the
+  client live in rse/protocols/, which rename a PFN during a transfer.
+  There is no catalogue-level rename, so justIN cannot offer one either.
+  """
+  if args.verb == 'rm':
+    return ['rucio erase %s' % args.did]
+
+  if args.verb == 'put':
+    return ['rucio upload --scope %s --rse %s %s'
+            % (args.scope, args.rse, args.path)]
+
+  if args.verb == 'mv':
+    # ATTACH FIRST, then detach. The obvious order is wrong: detaching
+    # first means a failed attach leaves the file in NEITHER dataset,
+    # which reads as data loss. Attaching first means a failed detach
+    # leaves it in BOTH, which is untidy and trivially repaired. Prefer
+    # the failure you can see and fix.
+    return ['rucio attach %s %s' % (args.target_dataset, args.did),
+            'rucio detach %s %s' % (args.source_dataset, args.did)]
+
+  raise ValueError('unknown verb %r' % args.verb)
+
+
+def targetScope(args):
+  """Which scope this operation writes to."""
+  if args.verb == 'put':
+    return args.scope
+
+  return splitDID(args.did)[0]
+
+
+def report(identity, remaining, groups, scope, decision, calls):
+  """Print the whole picture: who you are, the verdict, and the plan."""
+  print()
+  print('  identity   %s   (token %s)' % (identity, remaining))
+  print('  groups     %s' % (', '.join(groups) if groups else '<none>'))
+  print('  scope      %s' % scope)
+  # LIKELY and UNDETERMINED are both uncertain, but not in the same way:
+  # one is an inference from the naming convention, the other is an
+  # absence of information. Labelling both "inferred" would overstate
+  # what UNDETERMINED knows.
+  qualifier = {
+    justin_decide.LIKELY:       '   (inferred)',
+    justin_decide.UNDETERMINED: '   (unknown)',
+  }.get(decision.outcome, '')
+
+  print('  decision   %s%s' % (decision.outcome, qualifier))
+  print('             %s' % decision.reason)
+  print()
+
+  for call in calls:
+    print('  would run  %s' % call)
+
+  account, source = justin_rucio.rucioAccount()
+
+  if account:
+    print('  as         %s   (from %s)' % (account, source))
+  else:
+    # Not an error: it just means "setup rucio" has not been run in this
+    # shell. Saying so beats printing <unknown> and leaving you guessing.
+    print('  as         ? - run "setup rucio" to see the configured account')
+    print('             (the default rucio.cfg on the gpvm says dunepro)')
+
+  print()
+  print('  NOT EXECUTED. This tool predicts; it does not act. Wiring the')
+  print('  execution layer in justin_rucio.py is a deliberate, separate')
+  print('  step - see "Path A" in README.md.')
+  print()
+
+
+def buildParser():
+  parser = argparse.ArgumentParser(
+    prog='justin-files',
+    description='Would justIN let you manage this file? '
+                'Predicts only - executes nothing.',
+    epilog='Exit codes: %d allowed, %d denied, %d likely (inferred), '
+           '%d undetermined, %d error.'
+           % (EXIT_ALLOWED, EXIT_DENIED, EXIT_LIKELY,
+              EXIT_UNDETERMINED, EXIT_ERROR))
+
+  parser.add_argument('--principal',
+                      help='override the principal name from "justin whoami", '
+                           'e.g. danielsc@fnal.gov')
+  # Comma-separated rather than nargs='*': a greedy list argument sitting
+  # before a positional subcommand swallows the verb, so
+  # "--groups /dune rm dc4:x" parses 'rm' as a group and then fails for
+  # want of a verb.
+  parser.add_argument('--groups', metavar='G1,G2',
+                      help='override the groups from "justin whoami", '
+                           'comma-separated, e.g. --groups /dune,/dune/production. '
+                           'Use --groups "" for none.')
+  parser.add_argument('--refresh', action='store_true',
+                      help='re-fetch the scope table instead of using the cache')
+
+  # required=True is not accepted by add_subparsers() before Python 3.7,
+  # and the SL7 environment justIN users work in has 3.6. Enforce it in
+  # main() instead so this runs everywhere justIN does.
+  subparsers = parser.add_subparsers(dest='verb')
+
+  remove = subparsers.add_parser('rm', help='delete a file')
+  remove.add_argument('did', help='scope:name')
+
+  upload = subparsers.add_parser('put', help='upload a file into a scope')
+  upload.add_argument('path', help='local file to upload')
+  upload.add_argument('scope', help='destination scope')
+  upload.add_argument('--rse', default='DUNE_US_FNAL_DISK_STAGE',
+                      help='destination RSE (default: %(default)s)')
+
+  move = subparsers.add_parser('mv', help='move a file between datasets')
+  move.add_argument('did', help='scope:name')
+  move.add_argument('source_dataset', help='dataset to detach from')
+  move.add_argument('target_dataset', help='dataset to attach to')
+
+  return parser
+
+
+def main():
+  parser = buildParser()
+  args = parser.parse_args()
+
+  if not args.verb:
+    parser.error('a verb is required (put, rm or mv)')
+
+  token = justin_token.readToken()
+  if token is None:
+    print('No justIN token found at %s' % justin_token.bearerTokenPath(),
+          file=sys.stderr)
+    print('Run "justin get-token" first.', file=sys.stderr)
+    return EXIT_ERROR
+
+  try:
+    claims = justin_token.tokenClaims(token)
+  except ValueError as e:
+    print('Token is unreadable: %s' % str(e), file=sys.stderr)
+    return EXIT_ERROR
+
+  secondsLeft = justin_token.secondsRemaining(claims)
+  if secondsLeft is not None and secondsLeft <= 0:
+    print('Your token expired %dm ago. Run "justin get-token".'
+          % (-secondsLeft // 60), file=sys.stderr)
+    return EXIT_ERROR
+
+  # None means "not given"; an empty string means "explicitly no groups",
+  # which is a legitimate thing to test against.
+  groupsOverride = None
+  if args.groups is not None:
+    groupsOverride = [g for g in args.groups.split(',') if g]
+
+  try:
+    identity, groups = resolveIdentity(args.principal, groupsOverride)
+  except justin_identity.IdentityError as e:
+    print('Could not establish who you are: %s' % str(e), file=sys.stderr)
+    print('Or pass --principal and --groups explicitly.', file=sys.stderr)
+    return EXIT_ERROR
+
+  try:
+    scope = targetScope(args)
+    calls = plannedCalls(args)
+  except ValueError as e:
+    print('%s' % str(e), file=sys.stderr)
+    return EXIT_ERROR
+
+  if not justin_scopes.stringIsScope(scope):
+    print('%s is not a valid scope name' % scope, file=sys.stderr)
+    return EXIT_ERROR
+
+  try:
+    scopes, source = justin_scopes.loadScopes(refresh=args.refresh)
+  except Exception as e:
+    print('Could not load justIN\'s scope table: %s' % str(e), file=sys.stderr)
+    return EXIT_ERROR
+
+  decision = justin_decide.decide(scope, scopes, identity, groups)
+
+  report(identity,
+         justin_token.describeRemaining(secondsLeft),
+         groups,
+         scope,
+         decision,
+         calls)
+
+  return EXIT_FOR[decision.outcome]
+
+
+if __name__ == '__main__':
+  sys.exit(main())
