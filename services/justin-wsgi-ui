@@ -1556,6 +1556,341 @@ def checkScopeWritable(scopeName, user):
 
   return None
 
+
+# Matches what "rucio erase" does (rucio/cli/bin_legacy/rucio.py:833):
+# Rucio removes the file after this long, and clearing the lifetime
+# within the window cancels it.
+rmFileLifetimeSeconds = 86400
+
+# A cap on list-files, so that one request against a large scope cannot
+# hold a worker open streaming an unbounded result from Rucio.
+listFilesMaximum = 10000
+
+def rmFileCmd(startResponse, jsonDict, user):
+
+  try:
+    fileDID = jsonDict['file_did']
+  except:
+    return httpError(startResponse, '400 Bad Request',
+                     'File DID must be given with --file-did')
+
+  if not fileDID or not justin.stringIsDID(fileDID) or ':' not in fileDID:
+    return httpError(startResponse, '400 Bad Request',
+                     'File DID must be given as scope:name')
+
+  scopeName, _, fileName = fileDID.partition(':')
+
+  if not fileName or not justin.stringIsFile(fileName):
+    return httpError(startResponse, '400 Bad Request',
+                     'File name can only be characters a-z A-Z 0-9 - _ .')
+
+  refusal = checkScopeWritable(scopeName, user)
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
+
+  # First version: personal scopes only. Group scopes need attribution
+  # first, because every operation runs as dunepro and many people share
+  # write access. See prototypes/user-scope-tools/README.md
+  if not scopeName.startswith('user.'):
+    return httpError(startResponse, '403 Forbidden',
+                     'justin rm-file currently supports only your own '
+                     'user.<name> scope, not shared scope %s' % scopeName)
+
+  try:
+    didClient = rucio.client.didclient.DIDClient()
+  except Exception as e:
+    print('Connect to Rucio fails with: ' + str(e), file=sys.stderr)
+    return httpError(startResponse, '500 Internal Server Error',
+                     'justIN server failed to connect to Rucio')
+
+  try:
+    didClient.set_metadata(scope = scopeName, name = fileName,
+                           key = 'lifetime', value = rmFileLifetimeSeconds)
+  except Exception as e:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'Failed to set lifetime on %s: %s' % (fileDID, str(e)))
+
+  return httpOK(startResponse, '%s will be removed by Rucio in %d seconds\n'
+                               % (fileDID, rmFileLifetimeSeconds))
+
+def splitFileDID(fileDID):
+  """'scope:name' -> (scope, name). Raises ValueError if malformed."""
+  if not fileDID or not justin.stringIsDID(fileDID) or ':' not in fileDID:
+    raise ValueError('File DID must be given as scope:name')
+
+  scopeName, _, fileName = fileDID.partition(':')
+
+  if not fileName or not justin.stringIsFile(fileName):
+    raise ValueError('File name can only be characters a-z A-Z 0-9 - _ .')
+
+  return scopeName, fileName
+
+def undoRmFileCmd(startResponse, jsonDict, user):
+  """Cancel a pending removal by clearing the lifetime again.
+
+  This is what "rucio erase --undo" does. It only works inside the grace
+  period: the Rucio CLI warns that erase is irreversible after 24 hours,
+  and after that the file is gone and this will fail.
+  """
+  try:
+    fileDID = jsonDict['file_did']
+  except:
+    return httpError(startResponse, '400 Bad Request',
+                     'File DID must be given with --file-did')
+
+  try:
+    scopeName, fileName = splitFileDID(fileDID)
+  except ValueError as e:
+    return httpError(startResponse, '400 Bad Request', str(e))
+
+  refusal = checkScopeWritable(scopeName, user)
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
+
+  if not scopeName.startswith('user.'):
+    return httpError(startResponse, '403 Forbidden',
+                     'justin undo-rm-file currently supports only your own '
+                     'user.<name> scope, not shared scope %s' % scopeName)
+
+  try:
+    didClient = rucio.client.didclient.DIDClient()
+  except Exception as e:
+    print('Connect to Rucio fails with: ' + str(e), file=sys.stderr)
+    return httpError(startResponse, '500 Internal Server Error',
+                     'justIN server failed to connect to Rucio')
+
+  try:
+    didClient.set_metadata(scope = scopeName, name = fileName,
+                           key = 'lifetime', value = None)
+  except Exception as e:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'Failed to clear lifetime on %s: %s (the file may '
+                     'already be gone, or was never marked for removal)'
+                     % (fileDID, str(e)))
+
+  return httpOK(startResponse,
+                '%s is no longer scheduled for removal\n' % fileDID)
+
+def listFilesCmd(startResponse, jsonDict, user):
+  """List the files in a scope.
+
+  Read-only, and worth having on its own: a user cannot do this for
+  themselves today. The X.509 proxy from "justin get-token" is justIN's
+  jobs-no-roles certificate, which dune-rucio.fnal.gov refuses, so
+  "rucio list-dids" fails for an ordinary user. Reading file CONTENTS
+  from storage works; querying the catalogue does not.
+
+  DELIBERATELY STRICTER THAN IT NEEDS TO BE, and worth revisiting.
+
+  Listing is a read. None of the reasons the other commands are limited
+  to user.<name> scopes apply to it: nothing is modified, so there is
+  nothing to attribute and no blast radius. Rucio's own model lets any
+  DUNE member read the catalogue, so refusing to list dc4 here blocks
+  something harmless.
+
+  It is restricted anyway, for now, because one rule across four
+  commands is easier to review than two, and because relaxing a
+  restriction later is safe while adding one after people depend on the
+  behaviour is not. If the maintainers would rather this were open to
+  any valid session, the change is to drop both checks below - the
+  dispatcher has already established who the caller is.
+  """
+  try:
+    scopeName = jsonDict['scope']
+  except:
+    return httpError(startResponse, '400 Bad Request',
+                     'Scope must be given with --scope')
+
+  refusal = checkScopeWritable(scopeName, user)
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
+
+  if not scopeName.startswith('user.'):
+    return httpError(startResponse, '403 Forbidden',
+                     'justin list-files currently supports only your own '
+                     'user.<name> scope, not shared scope %s' % scopeName)
+
+  try:
+    didClient = rucio.client.didclient.DIDClient()
+  except Exception as e:
+    print('Connect to Rucio fails with: ' + str(e), file=sys.stderr)
+    return httpError(startResponse, '500 Internal Server Error',
+                     'justIN server failed to connect to Rucio')
+
+  try:
+    dids = didClient.list_dids(scope    = scopeName,
+                               filters  = {},
+                               did_type = 'file')
+
+    # list_dids returns an iterator that talks to Rucio as it is consumed,
+    # so the cap has to be applied here rather than after the fact.
+    output = ''
+    count  = 0
+
+    for did in dids:
+      if count >= listFilesMaximum:
+        output += ('... truncated at %d files\n' % listFilesMaximum)
+        break
+
+      output += '%s:%s\n' % (scopeName, did)
+      count  += 1
+
+  except Exception as e:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'Failed to list files in %s: %s' % (scopeName, str(e)))
+
+  if not count:
+    return httpOK(startResponse, 'No files in scope %s\n' % scopeName)
+
+  return httpOK(startResponse, output)
+
+def showFileCmd(startResponse, jsonDict, user):
+  """What Rucio knows about one file, including when it expires.
+
+  More useful than it first looks. Every justIN output already has a
+  lifetime - --lifetime-days is REQUIRED when a stage writes to Rucio
+  datasets - so every file a user owns is already on a clock that was
+  set when the stage was created, possibly months earlier. Nothing told
+  them what that clock says.
+
+  It also closes the loop on rm-file and undo-rm-file: after asking for
+  a removal, this is how you confirm it is pending, and after undoing
+  one, how you confirm it is not.
+  """
+  try:
+    fileDID = jsonDict['file_did']
+  except:
+    return httpError(startResponse, '400 Bad Request',
+                     'File DID must be given with --file-did')
+
+  try:
+    scopeName, fileName = splitFileDID(fileDID)
+  except ValueError as e:
+    return httpError(startResponse, '400 Bad Request', str(e))
+
+  refusal = checkScopeWritable(scopeName, user)
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
+
+  if not scopeName.startswith('user.'):
+    return httpError(startResponse, '403 Forbidden',
+                     'justin show-file currently supports only your own '
+                     'user.<name> scope, not shared scope %s' % scopeName)
+
+  try:
+    didClient = rucio.client.didclient.DIDClient()
+  except Exception as e:
+    print('Connect to Rucio fails with: ' + str(e), file=sys.stderr)
+    return httpError(startResponse, '500 Internal Server Error',
+                     'justIN server failed to connect to Rucio')
+
+  try:
+    metadata = didClient.get_metadata(scope = scopeName, name = fileName)
+  except Exception as e:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'Failed to get metadata for %s: %s' % (fileDID, str(e)))
+
+  # Show a chosen subset rather than everything Rucio returns, and only
+  # the keys that are actually present: the set varies with the Rucio
+  # version and the metadata plugin in use, so assuming any particular
+  # key exists would make this fragile.
+  interesting = ['bytes', 'adler32', 'md5', 'created_at', 'updated_at',
+                 'expired_at', 'account', 'availability', 'did_type']
+
+  output = 'did              %s\n' % fileDID
+
+  for key in interesting:
+    if key in metadata and metadata[key] is not None:
+      output += '%-16s %s\n' % (key, metadata[key])
+
+  if metadata.get('expired_at'):
+    output += ('\nThis file is scheduled for removal at the time above.\n'
+               'Run "justin undo-rm-file --file-did %s" to cancel,\n'
+               'while the grace period lasts.\n' % fileDID)
+
+  return httpOK(startResponse, output)
+
+def mvFileCmd(startResponse, jsonDict, user):
+  """Move a file from one dataset to another.
+
+  Rucio has no rename and no move. What it has is attach and detach, so a
+  "move" is a file joining one dataset and leaving another. The file
+  itself does not change: its DID, its replicas and its bytes are
+  untouched. Only dataset membership changes.
+
+  THREE scopes are involved - the file's, the source dataset's and the
+  target dataset's - and each is checked. That is stricter than Rucio,
+  which would let you attach another person's file to your own dataset,
+  but justIN should not be the thing that makes that easy.
+  """
+  try:
+    fileDID = jsonDict['file_did']
+  except:
+    return httpError(startResponse, '400 Bad Request',
+                     'File DID must be given with --file-did')
+
+  try:
+    fromDID = jsonDict['from_dataset']
+    toDID   = jsonDict['to_dataset']
+  except:
+    return httpError(startResponse, '400 Bad Request',
+                     'Both --from-dataset and --to-dataset must be given')
+
+  try:
+    fileScope, fileName = splitFileDID(fileDID)
+    fromScope, fromName = splitFileDID(fromDID)
+    toScope,   toName   = splitFileDID(toDID)
+  except ValueError as e:
+    return httpError(startResponse, '400 Bad Request',
+                     'Dataset DIDs must be given as scope:name (%s)' % str(e))
+
+  if fromDID == toDID:
+    return httpError(startResponse, '400 Bad Request',
+                     'Source and target datasets are the same')
+
+  for scopeName in [fileScope, fromScope, toScope]:
+    refusal = checkScopeWritable(scopeName, user)
+    if refusal is not None:
+      return httpError(startResponse, refusal[0], refusal[1])
+
+    if not scopeName.startswith('user.'):
+      return httpError(startResponse, '403 Forbidden',
+                       'justin mv-file currently supports only your own '
+                       'user.<name> scope, not shared scope %s' % scopeName)
+
+  try:
+    didClient = rucio.client.didclient.DIDClient()
+  except Exception as e:
+    print('Connect to Rucio fails with: ' + str(e), file=sys.stderr)
+    return httpError(startResponse, '500 Internal Server Error',
+                     'justIN server failed to connect to Rucio')
+
+  theFile = [{'scope': fileScope, 'name': fileName}]
+
+  # ATTACH FIRST, THEN DETACH. The obvious order is the wrong one. If we
+  # detached first and the attach then failed, the file would belong to
+  # no dataset at all, which reads as data loss and needs someone to
+  # work out where it went. Attaching first means a failed detach leaves
+  # it in both datasets: untidy, obvious, and repaired by running the
+  # detach again.
+  try:
+    didClient.attach_dids(scope = toScope, name = toName, dids = theFile)
+  except Exception as e:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'Failed to attach %s to %s, nothing was changed: %s'
+                     % (fileDID, toDID, str(e)))
+
+  try:
+    didClient.detach_dids(scope = fromScope, name = fromName, dids = theFile)
+  except Exception as e:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'Attached %s to %s, but failed to detach it from %s, '
+                     'so it is now in both: %s'
+                     % (fileDID, toDID, fromDID, str(e)))
+
+  return httpOK(startResponse,
+                '%s moved from %s to %s\n' % (fileDID, fromDID, toDID))
+
 def showJobsCmd(startResponse, jsonDict):
 
   try:
@@ -2070,6 +2405,21 @@ def application(environ, startResponse):
 
   if jsonDict['command'] == 'fail-files':
     return failFilesCmd(startResponse, jsonDict, user)
+	
+  if jsonDict['command'] == 'rm-file':
+    return rmFileCmd(startResponse, jsonDict, user)
+
+  if jsonDict['command'] == 'undo-rm-file':
+    return undoRmFileCmd(startResponse, jsonDict, user)
+
+  if jsonDict['command'] == 'list-files':
+    return listFilesCmd(startResponse, jsonDict, user)
+
+  if jsonDict['command'] == 'mv-file':
+    return mvFileCmd(startResponse, jsonDict, user)
+
+  if jsonDict['command'] == 'show-file':
+    return showFileCmd(startResponse, jsonDict, user)
 
   if jsonDict['command'] == 'show-replicas':
     return showReplicasCmd(startResponse, jsonDict)
