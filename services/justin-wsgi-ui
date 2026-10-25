@@ -1500,7 +1500,7 @@ def failFilesCmd(startResponse, jsonDict, user):
   return httpOK(startResponse, '')
 
 def checkScopeWritable(scopeName, user):
-  """May this user create or remove files in this Rucio scope?
+  """May this user create or remove DIDs in this Rucio scope?
 
   Returns None if they may, or an (httpCode, message) tuple if not.
 
@@ -1556,144 +1556,84 @@ def checkScopeWritable(scopeName, user):
 
   return None
 
+# "rucio did remove" does not delete anything directly: it sets the DID's
+# lifetime so that Rucio expires it in 24 hours, and the removal is not
+# reversible once that grace period passes. These commands do the same, for
+# the same reason - a mistake stays recoverable for a day.
+didRemoveLifetimeSeconds = 86400
 
-# Matches what "rucio erase" does (rucio/cli/bin_legacy/rucio.py:833):
-# Rucio removes the file after this long, and clearing the lifetime
-# within the window cancels it.
-rmFileLifetimeSeconds = 86400
+# A cap on did-list, so that one request against a large scope cannot hold a
+# worker open streaming an unbounded result from Rucio.
+didListMaximum = 10000
 
-# A cap on list-files, so that one request against a large scope cannot
-# hold a worker open streaming an unbounded result from Rucio.
-listFilesMaximum = 10000
+# What did-list will accept, matching the Rucio client's own values.
+didTypes = ['all', 'collection', 'container', 'dataset', 'file']
 
-def rmFileCmd(startResponse, jsonDict, user):
+def splitDID(did):
+  """'scope:name' -> (scope, name). Raises ValueError if malformed.
 
-  try:
-    fileDID = jsonDict['file_did']
-  except:
-    return httpError(startResponse, '400 Bad Request',
-                     'File DID must be given with --file-did')
+  Deliberately does NOT distinguish a file from a dataset or container. A
+  collection DID has the same shape as a file DID, and every command here
+  is meant to work on both: "justin did-remove" on a dataset is a
+  legitimate thing to want, which is why these are named did-* rather than
+  *-file.
+  """
+  if not did or not justin.stringIsDID(did) or ':' not in did:
+    raise ValueError('DID must be given as scope:name')
 
-  if not fileDID or not justin.stringIsDID(fileDID) or ':' not in fileDID:
-    return httpError(startResponse, '400 Bad Request',
-                     'File DID must be given as scope:name')
+  scopeName, _, name = did.partition(':')
 
-  scopeName, _, fileName = fileDID.partition(':')
+  if not name or not justin.stringIsFile(name):
+    raise ValueError('DID name can only be characters a-z A-Z 0-9 - _ .')
 
-  if not fileName or not justin.stringIsFile(fileName):
-    return httpError(startResponse, '400 Bad Request',
-                     'File name can only be characters a-z A-Z 0-9 - _ .')
+  return scopeName, name
 
-  refusal = checkScopeWritable(scopeName, user)
-  if refusal is not None:
-    return httpError(startResponse, refusal[0], refusal[1])
+def authoriseDID(did, user, verb):
+  """Split a DID and check the caller may write to its scope.
 
-  # First version: personal scopes only. Group scopes need attribution
-  # first, because every operation runs as dunepro and many people share
-  # write access. See prototypes/user-scope-tools/README.md
-  if not scopeName.startswith('user.'):
-    return httpError(startResponse, '403 Forbidden',
-                     'justin rm-file currently supports only your own '
-                     'user.<name> scope, not shared scope %s' % scopeName)
-
-  try:
-    didClient = rucio.client.didclient.DIDClient()
-  except Exception as e:
-    print('Connect to Rucio fails with: ' + str(e), file=sys.stderr)
-    return httpError(startResponse, '500 Internal Server Error',
-                     'justIN server failed to connect to Rucio')
-
-  try:
-    didClient.set_metadata(scope = scopeName, name = fileName,
-                           key = 'lifetime', value = rmFileLifetimeSeconds)
-  except Exception as e:
-    return httpError(startResponse, '500 Internal Server Error',
-                     'Failed to set lifetime on %s: %s' % (fileDID, str(e)))
-
-  return httpOK(startResponse, '%s will be removed by Rucio in %d seconds\n'
-                               % (fileDID, rmFileLifetimeSeconds))
-
-def splitFileDID(fileDID):
-  """'scope:name' -> (scope, name). Raises ValueError if malformed."""
-  if not fileDID or not justin.stringIsDID(fileDID) or ':' not in fileDID:
-    raise ValueError('File DID must be given as scope:name')
-
-  scopeName, _, fileName = fileDID.partition(':')
-
-  if not fileName or not justin.stringIsFile(fileName):
-    raise ValueError('File name can only be characters a-z A-Z 0-9 - _ .')
-
-  return scopeName, fileName
-
-def undoRmFileCmd(startResponse, jsonDict, user):
-  """Cancel a pending removal by clearing the lifetime again.
-
-  This is what "rucio erase --undo" does. It only works inside the grace
-  period: the Rucio CLI warns that erase is irreversible after 24 hours,
-  and after that the file is gone and this will fail.
+  Returns (scope, name, None) when permitted, or
+  (None, None, (httpCode, message)) when not.
   """
   try:
-    fileDID = jsonDict['file_did']
-  except:
-    return httpError(startResponse, '400 Bad Request',
-                     'File DID must be given with --file-did')
-
-  try:
-    scopeName, fileName = splitFileDID(fileDID)
+    scopeName, name = splitDID(did)
   except ValueError as e:
-    return httpError(startResponse, '400 Bad Request', str(e))
+    return None, None, ('400 Bad Request', str(e))
 
   refusal = checkScopeWritable(scopeName, user)
   if refusal is not None:
-    return httpError(startResponse, refusal[0], refusal[1])
+    return None, None, refusal
 
+  # Personal scopes only, for now. Every operation runs as dunepro, and a
+  # user.<name> scope has exactly one possible writer, so the scope name is
+  # the attribution. A group scope has dozens of writers and nothing would
+  # record which of them asked.
+  #
+  # TO EXTEND TO GROUP SCOPES: delete this block. checkScopeWritable()
+  # already handles group-owned scopes correctly and is tested for it. The
+  # missing piece is attribution - justin.logEvent() takes no user and the
+  # events table has no user_id column.
   if not scopeName.startswith('user.'):
-    return httpError(startResponse, '403 Forbidden',
-                     'justin undo-rm-file currently supports only your own '
-                     'user.<name> scope, not shared scope %s' % scopeName)
+    return None, None, ('403 Forbidden',
+                        'justin %s currently supports only your own '
+                        'user.<name> scope, not shared scope %s'
+                        % (verb, scopeName))
 
+  return scopeName, name, None
+
+def rucioDIDClient():
+  """A Rucio DIDClient, or None if Rucio cannot be reached."""
   try:
-    didClient = rucio.client.didclient.DIDClient()
+    return rucio.client.didclient.DIDClient()
   except Exception as e:
     print('Connect to Rucio fails with: ' + str(e), file=sys.stderr)
-    return httpError(startResponse, '500 Internal Server Error',
-                     'justIN server failed to connect to Rucio')
+    return None
 
-  try:
-    didClient.set_metadata(scope = scopeName, name = fileName,
-                           key = 'lifetime', value = None)
-  except Exception as e:
-    return httpError(startResponse, '500 Internal Server Error',
-                     'Failed to clear lifetime on %s: %s (the file may '
-                     'already be gone, or was never marked for removal)'
-                     % (fileDID, str(e)))
+def didListCmd(startResponse, jsonDict, user):
+  """List the DIDs in a scope: files, datasets, containers or all.
 
-  return httpOK(startResponse,
-                '%s is no longer scheduled for removal\n' % fileDID)
-
-def listFilesCmd(startResponse, jsonDict, user):
-  """List the files in a scope.
-
-  Read-only, and worth having on its own: a user cannot do this for
-  themselves today. The X.509 proxy from "justin get-token" is justIN's
-  jobs-no-roles certificate, which dune-rucio.fnal.gov refuses, so
-  "rucio list-dids" fails for an ordinary user. Reading file CONTENTS
-  from storage works; querying the catalogue does not.
-
-  DELIBERATELY STRICTER THAN IT NEEDS TO BE, and worth revisiting.
-
-  Listing is a read. None of the reasons the other commands are limited
-  to user.<name> scopes apply to it: nothing is modified, so there is
-  nothing to attribute and no blast radius. Rucio's own model lets any
-  DUNE member read the catalogue, so refusing to list dc4 here blocks
-  something harmless.
-
-  It is restricted anyway, for now, because one rule across four
-  commands is easier to review than two, and because relaxing a
-  restriction later is safe while adding one after people depend on the
-  behaviour is not. If the maintainers would rather this were open to
-  any valid session, the change is to drop both checks below - the
-  dispatcher has already established who the caller is.
+  Worth having even though reads are possible outside justIN, because this
+  needs no Rucio client setup and no separate token: the session the justin
+  command already holds is enough.
   """
   try:
     scopeName = jsonDict['scope']
@@ -1701,26 +1641,34 @@ def listFilesCmd(startResponse, jsonDict, user):
     return httpError(startResponse, '400 Bad Request',
                      'Scope must be given with --scope')
 
+  didType = jsonDict.get('did_type') or 'all'
+
+  if didType not in didTypes:
+    return httpError(startResponse, '400 Bad Request',
+                     '--did-type must be one of: %s' % ', '.join(didTypes))
+
+  if not justin.stringIsScope(scopeName):
+    return httpError(startResponse, '400 Bad Request',
+                     'Scope name can only be characters a-z 0-9 - _ .')
+
   refusal = checkScopeWritable(scopeName, user)
   if refusal is not None:
     return httpError(startResponse, refusal[0], refusal[1])
 
   if not scopeName.startswith('user.'):
     return httpError(startResponse, '403 Forbidden',
-                     'justin list-files currently supports only your own '
+                     'justin did-list currently supports only your own '
                      'user.<name> scope, not shared scope %s' % scopeName)
 
-  try:
-    didClient = rucio.client.didclient.DIDClient()
-  except Exception as e:
-    print('Connect to Rucio fails with: ' + str(e), file=sys.stderr)
+  didClient = rucioDIDClient()
+  if didClient is None:
     return httpError(startResponse, '500 Internal Server Error',
                      'justIN server failed to connect to Rucio')
 
   try:
     dids = didClient.list_dids(scope    = scopeName,
                                filters  = {},
-                               did_type = 'file')
+                               did_type = didType)
 
     # list_dids returns an iterator that talks to Rucio as it is consumed,
     # so the cap has to be applied here rather than after the fact.
@@ -1728,8 +1676,8 @@ def listFilesCmd(startResponse, jsonDict, user):
     count  = 0
 
     for did in dids:
-      if count >= listFilesMaximum:
-        output += ('... truncated at %d files\n' % listFilesMaximum)
+      if count >= didListMaximum:
+        output += ('... truncated at %d DIDs\n' % didListMaximum)
         break
 
       output += '%s:%s\n' % (scopeName, did)
@@ -1737,159 +1685,307 @@ def listFilesCmd(startResponse, jsonDict, user):
 
   except Exception as e:
     return httpError(startResponse, '500 Internal Server Error',
-                     'Failed to list files in %s: %s' % (scopeName, str(e)))
+                     'Failed to list DIDs in %s: %s' % (scopeName, str(e)))
 
   if not count:
-    return httpOK(startResponse, 'No files in scope %s\n' % scopeName)
+    return httpOK(startResponse,
+                  'No DIDs of type %s in scope %s\n' % (didType, scopeName))
 
   return httpOK(startResponse, output)
 
-def showFileCmd(startResponse, jsonDict, user):
-  """What Rucio knows about one file, including when it expires.
+def didShowCmd(startResponse, jsonDict, user):
+  """What Rucio knows about one DID, file or collection.
 
-  More useful than it first looks. Every justIN output already has a
-  lifetime - --lifetime-days is REQUIRED when a stage writes to Rucio
-  datasets - so every file a user owns is already on a clock that was
-  set when the stage was created, possibly months earlier. Nothing told
-  them what that clock says.
+  This is Rucio's own metadata, which is thin. The richer per-file metadata
+  lives in MetaCat and is readable interactively without justIN or Rucio,
+  so there is deliberately no justIN command for it.
 
-  It also closes the loop on rm-file and undo-rm-file: after asking for
-  a removal, this is how you confirm it is pending, and after undoing
-  one, how you confirm it is not.
+  What makes this worth having is the expiry: every justIN output carries a
+  lifetime, set when the stage was created and possibly months earlier, and
+  nothing else surfaces it.
   """
   try:
-    fileDID = jsonDict['file_did']
+    did = jsonDict['did']
   except:
     return httpError(startResponse, '400 Bad Request',
-                     'File DID must be given with --file-did')
+                     'DID must be given with --did')
 
-  try:
-    scopeName, fileName = splitFileDID(fileDID)
-  except ValueError as e:
-    return httpError(startResponse, '400 Bad Request', str(e))
-
-  refusal = checkScopeWritable(scopeName, user)
+  scopeName, name, refusal = authoriseDID(did, user, 'did-show')
   if refusal is not None:
     return httpError(startResponse, refusal[0], refusal[1])
 
-  if not scopeName.startswith('user.'):
-    return httpError(startResponse, '403 Forbidden',
-                     'justin show-file currently supports only your own '
-                     'user.<name> scope, not shared scope %s' % scopeName)
-
-  try:
-    didClient = rucio.client.didclient.DIDClient()
-  except Exception as e:
-    print('Connect to Rucio fails with: ' + str(e), file=sys.stderr)
+  didClient = rucioDIDClient()
+  if didClient is None:
     return httpError(startResponse, '500 Internal Server Error',
                      'justIN server failed to connect to Rucio')
 
   try:
-    metadata = didClient.get_metadata(scope = scopeName, name = fileName)
+    metadata = didClient.get_metadata(scope = scopeName, name = name)
   except Exception as e:
     return httpError(startResponse, '500 Internal Server Error',
-                     'Failed to get metadata for %s: %s' % (fileDID, str(e)))
+                     'Failed to get metadata for %s: %s' % (did, str(e)))
 
-  # Show a chosen subset rather than everything Rucio returns, and only
-  # the keys that are actually present: the set varies with the Rucio
-  # version and the metadata plugin in use, so assuming any particular
-  # key exists would make this fragile.
-  interesting = ['bytes', 'adler32', 'md5', 'created_at', 'updated_at',
-                 'expired_at', 'account', 'availability', 'did_type']
+  # Show a chosen subset rather than everything Rucio returns, and only the
+  # keys that are actually present: the set varies with the Rucio version
+  # and the metadata plugin, so assuming any particular key exists would
+  # make this fragile.
+  interesting = ['did_type', 'bytes', 'length', 'adler32', 'md5',
+                 'created_at', 'updated_at', 'expired_at', 'account',
+                 'is_open', 'availability']
 
-  output = 'did              %s\n' % fileDID
+  output = 'did              %s\n' % did
 
   for key in interesting:
     if key in metadata and metadata[key] is not None:
       output += '%-16s %s\n' % (key, metadata[key])
 
   if metadata.get('expired_at'):
-    output += ('\nThis file is scheduled for removal at the time above.\n'
-               'Run "justin undo-rm-file --file-did %s" to cancel,\n'
-               'while the grace period lasts.\n' % fileDID)
+    output += ('\nThis DID is scheduled for removal at the time above.\n'
+               'Run "justin did-remove-undo --did %s" to cancel,\n'
+               'while the grace period lasts.\n' % did)
 
   return httpOK(startResponse, output)
 
-def mvFileCmd(startResponse, jsonDict, user):
-  """Move a file from one dataset to another.
+def didRemoveCmd(startResponse, jsonDict, user):
+  """Ask Rucio to expire a DID, as "rucio did remove" does.
 
-  Rucio has no rename and no move. What it has is attach and detach, so a
-  "move" is a file joining one dataset and leaving another. The file
-  itself does not change: its DID, its replicas and its bytes are
-  untouched. Only dataset membership changes.
+  Accepts a collection DID as readily as a file DID: removing a dataset you
+  created is a normal thing to want.
 
-  THREE scopes are involved - the file's, the source dataset's and the
-  target dataset's - and each is checked. That is stricter than Rucio,
-  which would let you attach another person's file to your own dataset,
-  but justIN should not be the thing that makes that easy.
+  NOTE FOR REVIEW: this is the first Rucio *write* performed by any justIN
+  service. The UI service already calls Rucio synchronously, but only to
+  read. If a write belongs in an agent rather than a request handler, this
+  should move; the authorisation above is unaffected either way.
   """
   try:
-    fileDID = jsonDict['file_did']
+    did = jsonDict['did']
   except:
     return httpError(startResponse, '400 Bad Request',
-                     'File DID must be given with --file-did')
+                     'DID must be given with --did')
+
+  scopeName, name, refusal = authoriseDID(did, user, 'did-remove')
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
+
+  didClient = rucioDIDClient()
+  if didClient is None:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'justIN server failed to connect to Rucio')
 
   try:
-    fromDID = jsonDict['from_dataset']
-    toDID   = jsonDict['to_dataset']
+    didClient.set_metadata(scope = scopeName,
+                           name  = name,
+                           key   = 'lifetime',
+                           value = didRemoveLifetimeSeconds)
+  except Exception as e:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'Failed to set lifetime on %s: %s' % (did, str(e)))
+
+  return httpOK(startResponse,
+                '%s will be removed by Rucio in %d seconds\n'
+                'Run "justin did-remove-undo --did %s" to cancel\n'
+                % (did, didRemoveLifetimeSeconds, did))
+
+def didRemoveUndoCmd(startResponse, jsonDict, user):
+  """Cancel a pending removal, as "rucio did remove --undo" does.
+
+  Only works inside the grace period. After that the DID is gone and this
+  will fail.
+  """
+  try:
+    did = jsonDict['did']
   except:
     return httpError(startResponse, '400 Bad Request',
-                     'Both --from-dataset and --to-dataset must be given')
+                     'DID must be given with --did')
+
+  scopeName, name, refusal = authoriseDID(did, user, 'did-remove-undo')
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
+
+  didClient = rucioDIDClient()
+  if didClient is None:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'justIN server failed to connect to Rucio')
 
   try:
-    fileScope, fileName = splitFileDID(fileDID)
-    fromScope, fromName = splitFileDID(fromDID)
-    toScope,   toName   = splitFileDID(toDID)
-  except ValueError as e:
+    didClient.set_metadata(scope = scopeName, name = name,
+                           key = 'lifetime', value = None)
+  except Exception as e:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'Failed to clear lifetime on %s: %s (it may already be '
+                     'gone, or was never marked for removal)' % (did, str(e)))
+
+  return httpOK(startResponse,
+                '%s is no longer scheduled for removal\n' % did)
+
+def didContentAddCmd(startResponse, jsonDict, user):
+  """Attach a DID to a collection, as "rucio did content add" does.
+
+  Both the DID and the target collection must be in scopes the caller may
+  write to, which is stricter than Rucio - there you could attach another
+  person's file to your own dataset.
+
+  ORDERING MATTERS when moving a DID between collections. Add to the new
+  collection FIRST, then remove from the old one. A DID's replicas are kept
+  by the rules on the collections holding it, so a DID briefly held by none
+  is a DID eligible for deletion. Adding first keeps it covered throughout.
+  Even so the two calls are not atomic, and a reaper running between them
+  can still remove replicas - the window is narrowed, not closed.
+  """
+  try:
+    did = jsonDict['did']
+    collection = jsonDict['to_dataset']
+  except:
     return httpError(startResponse, '400 Bad Request',
-                     'Dataset DIDs must be given as scope:name (%s)' % str(e))
+                     'Both --did and --to-dataset must be given')
 
-  if fromDID == toDID:
+  scopeName, name, refusal = authoriseDID(did, user, 'did-content-add')
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
+
+  toScope, toName, refusal = authoriseDID(collection, user,
+                                          'did-content-add')
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
+
+  if did == collection:
     return httpError(startResponse, '400 Bad Request',
-                     'Source and target datasets are the same')
+                     'A DID cannot be attached to itself')
 
-  for scopeName in [fileScope, fromScope, toScope]:
-    refusal = checkScopeWritable(scopeName, user)
-    if refusal is not None:
-      return httpError(startResponse, refusal[0], refusal[1])
-
-    if not scopeName.startswith('user.'):
-      return httpError(startResponse, '403 Forbidden',
-                       'justin mv-file currently supports only your own '
-                       'user.<name> scope, not shared scope %s' % scopeName)
+  didClient = rucioDIDClient()
+  if didClient is None:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'justIN server failed to connect to Rucio')
 
   try:
-    didClient = rucio.client.didclient.DIDClient()
+    didClient.attach_dids(scope = toScope, name = toName,
+                          dids = [{'scope': scopeName, 'name': name}])
+  except Exception as e:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'Failed to attach %s to %s: %s' % (did, collection, str(e)))
+
+  return httpOK(startResponse, '%s attached to %s\n' % (did, collection))
+
+def didContentRemoveCmd(startResponse, jsonDict, user):
+  """Detach a DID from a collection, as "rucio did content remove" does.
+
+  See the ordering note in didContentAddCmd: when moving a DID, add it to
+  the new collection before removing it from the old one.
+  """
+  try:
+    did = jsonDict['did']
+    collection = jsonDict['from_dataset']
+  except:
+    return httpError(startResponse, '400 Bad Request',
+                     'Both --did and --from-dataset must be given')
+
+  scopeName, name, refusal = authoriseDID(did, user, 'did-content-remove')
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
+
+  fromScope, fromName, refusal = authoriseDID(collection, user,
+                                              'did-content-remove')
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
+
+  didClient = rucioDIDClient()
+  if didClient is None:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'justIN server failed to connect to Rucio')
+
+  try:
+    didClient.detach_dids(scope = fromScope, name = fromName,
+                          dids = [{'scope': scopeName, 'name': name}])
+  except Exception as e:
+    return httpError(startResponse, '500 Internal Server Error',
+                     'Failed to detach %s from %s: %s'
+                     % (did, collection, str(e)))
+
+  return httpOK(startResponse, '%s detached from %s\n' % (did, collection))
+
+def ruleUpdateCmd(startResponse, jsonDict, user):
+  """Change the lifetime of a replication rule, as "rucio rule update" does.
+
+  This is the one that decides how long your data actually survives. A
+  DID's replicas are kept by the rules on it, and a justIN workflow sets
+  that lifetime once at stage creation with --lifetime-days. Until now
+  there was no way to change it afterwards: data you wanted to keep expired
+  on a schedule chosen months earlier, and data you no longer wanted sat
+  against your quota until it did.
+
+  --lifetime-days 0 expires the rule now. Larger values extend it.
+
+  Clearing the lifetime entirely, which "rucio rule update --lifetime None"
+  allows, is deliberately NOT offered: a rule with no expiry holds storage
+  against a quota forever, and that decision should not be a single
+  command.
+
+  Find a rule id with "rucio rule list <did>", which works interactively
+  with your own Rucio account.
+  """
+  try:
+    ruleID = jsonDict['rule_id']
+  except:
+    return httpError(startResponse, '400 Bad Request',
+                     'Rule ID must be given with --rule-id')
+
+  if not ruleID or re.search('[^0-9a-fA-F]', ruleID) or len(ruleID) != 32:
+    return httpError(startResponse, '400 Bad Request',
+                     'Rule ID must be 32 hexadecimal characters')
+
+  try:
+    lifetimeDays = int(jsonDict['lifetime_days'])
+  except:
+    return httpError(startResponse, '400 Bad Request',
+                     'Lifetime must be given with --lifetime-days '
+                     '(0 expires the rule now)')
+
+  if lifetimeDays < 0:
+    return httpError(startResponse, '400 Bad Request',
+                     '--lifetime-days cannot be negative')
+
+  try:
+    ruleClient = rucio.client.ruleclient.RuleClient()
   except Exception as e:
     print('Connect to Rucio fails with: ' + str(e), file=sys.stderr)
     return httpError(startResponse, '500 Internal Server Error',
                      'justIN server failed to connect to Rucio')
 
-  theFile = [{'scope': fileScope, 'name': fileName}]
-
-  # ATTACH FIRST, THEN DETACH. The obvious order is the wrong one. If we
-  # detached first and the attach then failed, the file would belong to
-  # no dataset at all, which reads as data loss and needs someone to
-  # work out where it went. Attaching first means a failed detach leaves
-  # it in both datasets: untidy, obvious, and repaired by running the
-  # detach again.
+  # Authorise against the scope of the DID the rule holds, which means
+  # reading the rule before touching it.
   try:
-    didClient.attach_dids(scope = toScope, name = toName, dids = theFile)
+    rule = ruleClient.get_replication_rule(ruleID)
+    ruleScope = rule['scope']
+    ruleName  = rule['name']
+  except Exception as e:
+    return httpError(startResponse, '404 Not Found',
+                     'No rule %s, or it could not be read: %s'
+                     % (ruleID, str(e)))
+
+  refusal = checkScopeWritable(ruleScope, user)
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
+
+  if not ruleScope.startswith('user.'):
+    return httpError(startResponse, '403 Forbidden',
+                     'justin rule-update currently supports only rules on '
+                     'your own user.<name> scope, not on %s' % ruleScope)
+
+  try:
+    ruleClient.update_replication_rule(ruleID,
+                                       {'lifetime': lifetimeDays * 86400})
   except Exception as e:
     return httpError(startResponse, '500 Internal Server Error',
-                     'Failed to attach %s to %s, nothing was changed: %s'
-                     % (fileDID, toDID, str(e)))
+                     'Failed to update rule %s: %s' % (ruleID, str(e)))
 
-  try:
-    didClient.detach_dids(scope = fromScope, name = fromName, dids = theFile)
-  except Exception as e:
-    return httpError(startResponse, '500 Internal Server Error',
-                     'Attached %s to %s, but failed to detach it from %s, '
-                     'so it is now in both: %s'
-                     % (fileDID, toDID, fromDID, str(e)))
+  if lifetimeDays == 0:
+    return httpOK(startResponse,
+                  'Rule %s on %s:%s now expires immediately\n'
+                  % (ruleID, ruleScope, ruleName))
 
   return httpOK(startResponse,
-                '%s moved from %s to %s\n' % (fileDID, fromDID, toDID))
+                'Rule %s on %s:%s now expires in %d days\n'
+                % (ruleID, ruleScope, ruleName, lifetimeDays))
 
 def showJobsCmd(startResponse, jsonDict):
 
@@ -2406,20 +2502,26 @@ def application(environ, startResponse):
   if jsonDict['command'] == 'fail-files':
     return failFilesCmd(startResponse, jsonDict, user)
 	
-  if jsonDict['command'] == 'rm-file':
-    return rmFileCmd(startResponse, jsonDict, user)
+  if jsonDict['command'] == 'did-list':
+    return didListCmd(startResponse, jsonDict, user)
 
-  if jsonDict['command'] == 'undo-rm-file':
-    return undoRmFileCmd(startResponse, jsonDict, user)
+  if jsonDict['command'] == 'did-show':
+    return didShowCmd(startResponse, jsonDict, user)
 
-  if jsonDict['command'] == 'list-files':
-    return listFilesCmd(startResponse, jsonDict, user)
+  if jsonDict['command'] == 'did-remove':
+    return didRemoveCmd(startResponse, jsonDict, user)
 
-  if jsonDict['command'] == 'mv-file':
-    return mvFileCmd(startResponse, jsonDict, user)
+  if jsonDict['command'] == 'did-remove-undo':
+    return didRemoveUndoCmd(startResponse, jsonDict, user)
 
-  if jsonDict['command'] == 'show-file':
-    return showFileCmd(startResponse, jsonDict, user)
+  if jsonDict['command'] == 'did-content-add':
+    return didContentAddCmd(startResponse, jsonDict, user)
+
+  if jsonDict['command'] == 'did-content-remove':
+    return didContentRemoveCmd(startResponse, jsonDict, user)
+
+  if jsonDict['command'] == 'rule-update':
+    return ruleUpdateCmd(startResponse, jsonDict, user)
 
   if jsonDict['command'] == 'show-replicas':
     return showReplicasCmd(startResponse, jsonDict)

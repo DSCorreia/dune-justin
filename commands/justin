@@ -61,11 +61,13 @@ commands = [ "create-workflow",
              "show-workflows", "show-stages", "show-jobscript",
              "show-stage-outputs",
              "show-files",
-             "list-files",
-             "show-file",
-             "rm-file",
-             "undo-rm-file",
-             "mv-file",
+             "did-list",
+             "did-show",
+             "did-remove",
+             "did-remove-undo",
+             "did-content-add",
+             "did-content-remove",
+             "rule-update",
              "fail-files",
              "show-replicas", 
              "show-jobs",
@@ -100,13 +102,27 @@ parser.add_argument("--file-did",
                     type = str,
                     help = "File DID")
 
+parser.add_argument("--did",
+                    type = str,
+                    help = "DID of a file, dataset or container")
+
+parser.add_argument("--did-type",
+                    type = str,
+                    help = "all, collection, container, dataset or file, "
+                           "for did-list")
+
 parser.add_argument("--from-dataset",
                     type = str,
-                    help = "Dataset DID to move a file out of, for mv-file")
+                    help = "Collection DID to detach from, "
+                           "for did-content-remove")
 
 parser.add_argument("--to-dataset",
                     type = str,
-                    help = "Dataset DID to move a file into, for mv-file")
+                    help = "Collection DID to attach to, for did-content-add")
+
+parser.add_argument("--rule-id",
+                    type = str,
+                    help = "Rucio replication rule ID, for rule-update")
 
 #parser.add_argument("--site-name",
 #                    type = str,
