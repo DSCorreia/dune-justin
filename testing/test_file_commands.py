@@ -433,6 +433,55 @@ for handler, jd in refusals:
     print('   FAIL: %s committed on a refusal' % handler.__name__)
 print('   %d refusal paths checked: no Rucio calls, no commits' % len(refusals))
 
+# ------------------------------- the restriction lives in ONE place
+
+print()
+print('=== lifting refuseGroupScope() frees ALL seven, not some ===')
+
+# The point of this test. The guard used to be three separate copies, two
+# of them in handlers that take no DID, so deleting the obvious one would
+# have freed five commands and left did-list and rule-update refusing. If
+# anyone reintroduces a second copy, this fails.
+ruleRecord['scope'] = 'dc4'
+scopeContents['dc4'] = ['a.root']
+original = ui.refuseGroupScope
+ui.refuseGroupScope = lambda scopeName, verb: None
+
+GROUP_DS = 'dc4:dataset_one'
+for name, handler, jd in [
+    ('did-list',           ui.didListCmd,          {'scope': 'dc4'}),
+    ('did-show',           ui.didShowCmd,          {'did': 'dc4:t.root'}),
+    ('did-remove',         ui.didRemoveCmd,        {'did': 'dc4:t.root'}),
+    ('did-remove-undo',    ui.didRemoveUndoCmd,    {'did': 'dc4:t.root'}),
+    ('did-content-add',    ui.didContentAddCmd,    {'did': 'dc4:a.root',
+                                                    'to_dataset': GROUP_DS}),
+    ('did-content-remove', ui.didContentRemoveCmd, {'did': 'dc4:a.root',
+                                                    'from_dataset': GROUP_DS}),
+    ('rule-update',        ui.ruleUpdateCmd,       {'rule_id': RULEID,
+                                                    'lifetime_days': 30})]:
+  check('   ' + name + ' on a group scope', call(handler, jd)[0], '200')
+
+ui.refuseGroupScope = original
+ruleRecord['scope'] = MINE
+scopeContents.pop('dc4', None)
+
+print()
+print('   --- and with it restored, all seven refuse again ---')
+ruleRecord['scope'] = 'dc4'
+for name, handler, jd in [
+    ('did-list',           ui.didListCmd,          {'scope': 'dc4'}),
+    ('did-show',           ui.didShowCmd,          {'did': 'dc4:t.root'}),
+    ('did-remove',         ui.didRemoveCmd,        {'did': 'dc4:t.root'}),
+    ('did-remove-undo',    ui.didRemoveUndoCmd,    {'did': 'dc4:t.root'}),
+    ('did-content-add',    ui.didContentAddCmd,    {'did': 'dc4:a.root',
+                                                    'to_dataset': GROUP_DS}),
+    ('did-content-remove', ui.didContentRemoveCmd, {'did': 'dc4:a.root',
+                                                    'from_dataset': GROUP_DS}),
+    ('rule-update',        ui.ruleUpdateCmd,       {'rule_id': RULEID,
+                                                    'lifetime_days': 30})]:
+  check('   ' + name + ' on a group scope', call(handler, jd)[0], '403')
+ruleRecord['scope'] = MINE
+
 # ------------------------------------------ connection failure is 500
 
 print()

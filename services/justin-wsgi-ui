@@ -1588,6 +1588,32 @@ def splitDID(did):
 
   return scopeName, name
 
+def refuseGroupScope(scopeName, verb):
+  """Personal scopes only, for now. Returns None, or (httpCode, message).
+
+  Every operation runs as dunepro, and a user.<name> scope has exactly one
+  possible writer, so the scope name is the attribution. A group scope has
+  dozens of writers and nothing would record which of them asked.
+
+  TO EXTEND TO GROUP SCOPES: make this return None unconditionally, or
+  delete it and its three callers. checkScopeWritable() already handles
+  group-owned scopes correctly and is tested for it; the missing piece is
+  attribution - justin.logEvent() takes no user and the events table has
+  no user_id column.
+
+  THIS IS THE ONLY PLACE THE RESTRICTION LIVES. It was three separate
+  copies once, and two of them sat in handlers that do not take a DID
+  (did-list takes a scope, rule-update takes a rule id), so lifting the
+  restriction in the obvious place would have freed five commands and
+  left those two still refusing.
+  """
+  if scopeName.startswith('user.'):
+    return None
+
+  return ('403 Forbidden',
+          'justin %s currently supports only your own user.<name> scope, '
+          'not shared scope %s' % (verb, scopeName))
+
 def authoriseDID(did, user, verb):
   """Split a DID and check the caller may write to its scope.
 
@@ -1603,20 +1629,9 @@ def authoriseDID(did, user, verb):
   if refusal is not None:
     return None, None, refusal
 
-  # Personal scopes only, for now. Every operation runs as dunepro, and a
-  # user.<name> scope has exactly one possible writer, so the scope name is
-  # the attribution. A group scope has dozens of writers and nothing would
-  # record which of them asked.
-  #
-  # TO EXTEND TO GROUP SCOPES: delete this block. checkScopeWritable()
-  # already handles group-owned scopes correctly and is tested for it. The
-  # missing piece is attribution - justin.logEvent() takes no user and the
-  # events table has no user_id column.
-  if not scopeName.startswith('user.'):
-    return None, None, ('403 Forbidden',
-                        'justin %s currently supports only your own '
-                        'user.<name> scope, not shared scope %s'
-                        % (verb, scopeName))
+  refusal = refuseGroupScope(scopeName, verb)
+  if refusal is not None:
+    return None, None, refusal
 
   return scopeName, name, None
 
@@ -1655,10 +1670,9 @@ def didListCmd(startResponse, jsonDict, user):
   if refusal is not None:
     return httpError(startResponse, refusal[0], refusal[1])
 
-  if not scopeName.startswith('user.'):
-    return httpError(startResponse, '403 Forbidden',
-                     'justin did-list currently supports only your own '
-                     'user.<name> scope, not shared scope %s' % scopeName)
+  refusal = refuseGroupScope(scopeName, 'did-list')
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
 
   didClient = rucioDIDClient()
   if didClient is None:
@@ -1966,10 +1980,9 @@ def ruleUpdateCmd(startResponse, jsonDict, user):
   if refusal is not None:
     return httpError(startResponse, refusal[0], refusal[1])
 
-  if not ruleScope.startswith('user.'):
-    return httpError(startResponse, '403 Forbidden',
-                     'justin rule-update currently supports only rules on '
-                     'your own user.<name> scope, not on %s' % ruleScope)
+  refusal = refuseGroupScope(ruleScope, 'rule-update')
+  if refusal is not None:
+    return httpError(startResponse, refusal[0], refusal[1])
 
   try:
     ruleClient.update_replication_rule(ruleID,
