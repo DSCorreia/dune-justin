@@ -1598,8 +1598,15 @@ def refuseGroupScope(scopeName, verb):
   TO EXTEND TO GROUP SCOPES: make this return None unconditionally, or
   delete it and its three callers. checkScopeWritable() already handles
   group-owned scopes correctly and is tested for it; the missing piece is
-  attribution - justin.logEvent() takes no user and the events table has
-  no user_id column.
+  attribution.
+
+  Attribution is closer than it looks. The events table already HAS a
+  user_id column, indexed as (user_id, event_id), and has had since the
+  OIDC login work. Nothing populates it: there is exactly one
+  INSERT INTO events in the codebase, in justin.logEvent(), and it sets
+  every other column but not that one. So no schema change is needed -
+  logEvent() wants a userID parameter and one more line in its INSERT,
+  and these handlers already hold user['user_id'] to pass to it.
 
   THIS IS THE ONLY PLACE THE RESTRICTION LIVES. It was three separate
   copies once, and two of them sat in handlers that do not take a DID
